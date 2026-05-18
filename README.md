@@ -1,63 +1,133 @@
-# L2 Jikarus — Proximity Voice Chat Mod
+<div align="center">
 
-Sistema de voz por proximidade para servidor Lineage 2 privado, desenvolvido do zero sem uso de software externo para o jogador.
+# L2 Jikarus — Proximity Voice Chat
+
+**Sistema de voz por proximidade nativo para Lineage 2**
+
+![C++](https://img.shields.io/badge/C++-00599C?style=for-the-badge&logo=c%2B%2B&logoColor=white)
+![Node.js](https://img.shields.io/badge/Node.js-339933?style=for-the-badge&logo=nodedotjs&logoColor=white)
+![Win32](https://img.shields.io/badge/Win32_API-0078D4?style=for-the-badge&logo=windows&logoColor=white)
+![DirectX 9](https://img.shields.io/badge/DirectX_9-FF0000?style=for-the-badge&logo=microsoftedge&logoColor=white)
+![Java](https://img.shields.io/badge/Java-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)
+
+</div>
+
+---
+
+## Demo
+
+> 🎥 *GIF em breve — gravando demonstração in-game*
+
+O indicador aparece no canto superior esquerdo do jogo em tempo real:
+
+| Estado | Cor | Quando aparece |
+|---|---|---|
+| Inativo | ⬜ Cinza | Microfone aberto, sem fala |
+| Transmitindo | 🟩 Verde | VAD detectou voz |
+| Mutado | 🟥 Vermelho | Jogador silenciado |
+| Recebendo | 🔵🔵🔵 Azul | Outro jogador falando próximo |
+
+---
 
 ## Como funciona
 
 ```
-Microfone do jogador
-    │
-    ▼
-dinput8.dll (proxy + captura de áudio)
-    │  UDP 7779
-    ▼
-Voice Server (Node.js) — roteia por proximidade
-    │  UDP 7779
-    ▼
-dinput8.dll (playback) → Alto-falante do jogador próximo
+┌─────────────────────────────────────────────────────────┐
+│                     JOGADOR A                           │
+│  Microfone → waveIn (16kHz PCM) → VAD → UDP:7779       │
+└──────────────────────────┬──────────────────────────────┘
+                           │ UDP
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│              VOICE SERVER (Node.js)                     │
+│  Recebe posição 3D + áudio → calcula distância →        │
+│  volumeFactor = 1 - (dist / 2000) → roteia para         │
+│  jogadores dentro do range                              │
+└──────────────────────────┬──────────────────────────────┘
+                           │ UDP
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│                     JOGADOR B                           │
+│  waveOut → playback com volume proporcional à dist      │
+└─────────────────────────────────────────────────────────┘
+
+GameServer Java → TCP:7778 → broadcast posições a cada 500ms
 ```
 
-O servidor Java envia posições dos jogadores via TCP 7778 a cada 500ms.  
-O áudio só chega a jogadores dentro de 2000 unidades L2. O volume cai linearmente com a distância.
+---
 
-## Componentes
+## Destaques Técnicos
 
-| Pasta | Descrição |
-|---|---|
-| `Client/` | DLL proxy + captura/playback de áudio + overlay D3D9 |
-| `VoiceServer/` | Roteador UDP em Node.js |
+### dinput8.dll — Proxy + Hook D3D9
 
-## Tecnologias
+Carrega automaticamente junto com `L2.exe` como proxy do DirectInput. Sem instalador, sem software extra para o jogador — basta colocar a DLL na pasta `system/`.
 
-- **C++ (Win32)** — dinput8.dll proxy, `waveIn/waveOut` (16kHz PCM), hook D3D9 Present via detour inline
-- **Node.js** — roteador UDP stateless com cálculo de distância 3D
-- **Java** — integração com GameServer L2J para broadcast de posições via TCP
+**Hook D3D9 via detour inline (restore-call-repatch):**
+```cpp
+// Salva 5 bytes originais → escreve JMP → no hook: restaura → chama original → repatcha
+// Solução para Unreal Engine que cacheia o ponteiro Present na criação do device
+unpatch(g_detourPresent);
+HRESULT hr = originalPresent(dev, src, dst, wnd, rgn);
+repatch(g_detourPresent, hookedPresent);
+```
 
-## Overlay in-game
+### Roteamento UDP por Proximidade
 
-Indicador visual desenhado diretamente no DirectX 9 (sem janela separada):
+```javascript
+const factor = Math.max(0.0, 1.0 - d / VOICE_RANGE); // volume cai linearmente
+server.send(outPacket, other.port, other.address);
+```
 
-| Cor | Estado |
-|---|---|
-| Cinza | Microfone inativo |
-| Verde | Transmitindo (VAD ativo) |
-| Vermelho | Mutado |
-| Azul (3 pontos) | Recebendo áudio de jogador próximo |
+### VAD (Voice Activity Detection)
+
+```cpp
+// RMS sobre o frame PCM — só transmite se passar o threshold
+float rms = sqrt(sumSq / FRAME_SAMPLES);
+if (rms > g_vadThreshold) sendAudio();
+```
+
+---
+
+## Arquitetura de Componentes
+
+```
+Mods/VoiceChat/
+├── Client/
+│   ├── dllmain.cpp          # DLL proxy + captura + overlay D3D9
+│   ├── dinput8.def          # Export sem decoração stdcall
+│   └── voice_config.ini     # ServerIP e VadThreshold
+├── VoiceServer/
+│   └── server.js            # Roteador UDP Node.js
+└── Server/
+    ├── VoiceChatManager.java # TCP broadcast de posições
+    └── VoiceCommand.java     # Comando .voice no chat
+```
+
+---
 
 ## Build
 
+**Requisitos:** MSYS2 + MinGW-w32 (g++ 32-bit), Node.js 18+
+
 ```bash
-# Requer MSYS2 mingw32 (g++ 32-bit)
+# Client (DLL)
 g++ -m32 -shared -O2 -std=c++17 -o dinput8.dll dllmain.cpp dinput8.def \
     -ld3d9 -ldxguid -lws2_32 -lwinmm -lgdi32 -luser32
+
+# Voice Server
+node VoiceServer/server.js
 ```
 
-## Configuração (`voice_config.ini`)
+## Instalação
 
-```ini
-ServerIP=127.0.0.1
-VadThreshold=400
 ```
+1. Copiar dinput8.dll  →  L2/system/dinput8.dll
+2. Editar voice_config.ini com o IP do servidor
+3. Iniciar node server.js no servidor
+4. Abrir o jogo — overlay aparece automaticamente
+```
+
+---
 
 ## Desenvolvido por
 
