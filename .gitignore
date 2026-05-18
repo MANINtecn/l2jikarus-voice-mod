@@ -1,0 +1,16 @@
+# Binários compilados
+Client/dinput8.dll
+Client/VoiceProxy.exe
+Client/*.o
+Client/*.a
+Client/CMakeFiles/
+Client/CMakeCache.txt
+Client/cmake_install.cmake
+Client/Makefile
+
+# Logs de debug do jogo
+*.log
+
+# Node.js
+VoiceServer/node_modules/
+VoiceServer/package-lock.json
