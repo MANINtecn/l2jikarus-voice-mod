@@ -115,9 +115,9 @@ static std::mutex                              g_spkMtx;
 
 typedef HRESULT(WINAPI* Present_t)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 
-// ── WndProc subclass ─── globals (função definida abaixo, após as constantes) ─
-static HWND    g_gameHwnd    = nullptr;
-static WNDPROC g_origWndProc = nullptr;
+// ── Mouse hook (impede click de vazar para o jogo) ── globals ─────────────────
+static HWND  g_gameHwnd  = nullptr;
+static HHOOK g_mouseHook = nullptr;
 
 // ── Log ───────────────────────────────────────────────────────────────────────
 static std::string g_logPath;
@@ -231,8 +231,22 @@ static void recvThread() {
             ne.lastTalkMs = GetTickCount();
             isMuted       = ne.muted;
         }
-        if (!isMuted && !g_muted.load())
-            playAudio(pkt.speakerId, pkt.volumeFactor, pkt.samples);
+        if (!isMuted && !g_muted.load()) {
+            // Dedup: ignora pacote se já tocamos áudio deste speakerId nos últimos 15ms
+            // (evita double-play quando 2 contas no mesmo PC capturam o mesmo mic)
+            static std::unordered_map<uint32_t, DWORD> s_lastPlay;
+            static std::mutex s_lpMtx;
+            DWORD nowMs = GetTickCount();
+            bool skip = false;
+            {
+                std::lock_guard<std::mutex> lk(s_lpMtx);
+                auto& last = s_lastPlay[pkt.speakerId];
+                if (nowMs - last < 15) skip = true;
+                else last = nowMs;
+            }
+            if (!skip)
+                playAudio(pkt.speakerId, pkt.volumeFactor, pkt.samples);
+        }
     }
 }
 
@@ -498,20 +512,21 @@ static constexpr float ROW_H    = 32.0f;
 static constexpr float ROW_W    = 240.0f;
 static constexpr DWORD TALK_MS  = 600;
 
-// ── WndProc subclass (impede click de vazar para o jogo) ──────────────────────
-static LRESULT CALLBACK myWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_LBUTTONDOWN && g_run) {
-        int px = (int)(short)LOWORD(lp);
-        int py = (int)(short)HIWORD(lp);
-        if (px >= (int)OX && px < (int)(OX + ROW_W) && py >= (int)OY_LIST) {
+// ── WH_MOUSE hook (intercepta WM_LBUTTONDOWN antes de chegar ao jogo) ─────────
+static LRESULT CALLBACK mouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && wParam == WM_LBUTTONDOWN && g_gameHwnd && g_run) {
+        MOUSEHOOKSTRUCT* ms = (MOUSEHOOKSTRUCT*)lParam;
+        POINT pt = ms->pt;
+        ScreenToClient(g_gameHwnd, &pt);
+        if (pt.x >= (int)OX && pt.x < (int)(OX + ROW_W) && pt.y >= (int)OY_LIST) {
             int rows = 0;
             { std::lock_guard<std::mutex> l(g_partyMtx);  rows += (int)g_party.size(); }
             { std::lock_guard<std::mutex> l(g_nearbyMtx); rows += (int)g_nearby.size(); }
-            if (py < (int)(OY_LIST + rows * ROW_H))
-                return 0; // engole — não repassa para o jogo
+            if (pt.y < (int)(OY_LIST + rows * ROW_H))
+                return 1; // descarta — não passa para o jogo
         }
     }
-    return CallWindowProc(g_origWndProc, hwnd, msg, wp, lp);
+    return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
 }
 
 static void drawVoiceOverlay(IDirect3DDevice9* dev) {
@@ -522,8 +537,10 @@ static void drawVoiceOverlay(IDirect3DDevice9* dev) {
     D3DDEVICE_CREATION_PARAMETERS cp{};
     HWND hwnd = SUCCEEDED(dev->GetCreationParameters(&cp)) ? cp.hFocusWindow : nullptr;
     if (hwnd && !g_gameHwnd) {
-        g_gameHwnd    = hwnd;
-        g_origWndProc = (WNDPROC)SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)myWndProc);
+        g_gameHwnd  = hwnd;
+        DWORD tid   = GetWindowThreadProcessId(hwnd, nullptr);
+        g_mouseHook = SetWindowsHookExA(WH_MOUSE, mouseHookProc, nullptr, tid);
+        dbgLog("mouseHook=%p tid=%u", (void*)g_mouseHook, (unsigned)tid);
     }
 
     // Click detection (dispara apenas na borda de descida)
@@ -763,8 +780,7 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
         g_run = true; std::thread(voiceInit).detach(); break;
     case DLL_PROCESS_DETACH:
         g_run = false;
-        if (g_gameHwnd && g_origWndProc)
-            SetWindowLongPtrA(g_gameHwnd, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
+        if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
         if (g_waveIn) { waveInStop(g_waveIn); waveInReset(g_waveIn); waveInClose(g_waveIn); }
         if (g_udp != INVALID_SOCKET) closesocket(g_udp);
         if (g_tcp != INVALID_SOCKET) closesocket(g_tcp);
