@@ -115,6 +115,10 @@ static std::mutex                              g_spkMtx;
 
 typedef HRESULT(WINAPI* Present_t)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 
+// ── WndProc subclass ─── globals (função definida abaixo, após as constantes) ─
+static HWND    g_gameHwnd    = nullptr;
+static WNDPROC g_origWndProc = nullptr;
+
 // ── Log ───────────────────────────────────────────────────────────────────────
 static std::string g_logPath;
 static std::mutex  g_logMtx;
@@ -284,6 +288,11 @@ static void posThread() {
                         float x, y, z;
                         if (sscanf_s(p, "%f,%f,%f", &x, &y, &z) == 3) g_posX=x,g_posY=y,g_posZ=z;
                     }
+                    // Remove próprio nome de g_nearby (pode ter entrado antes do SELF: chegar)
+                    if (g_selfName[0]) {
+                        std::lock_guard<std::mutex> lkn(g_nearbyMtx);
+                        g_nearby.erase(std::string(g_selfName));
+                    }
                 } else if (line.rfind("NEARBY:", 0) == 0) {
                     const char* p = line.c_str() + 7;
                     std::lock_guard<std::mutex> lk(g_nearbyMtx);
@@ -294,7 +303,8 @@ static void posThread() {
                         while (tok && tok[0]) {
                             char* colon = strchr(tok, ':');
                             if (colon) *colon = '\0'; // extrai só o nome
-                            if (tok[0]) {
+                            // nunca adiciona o próprio personagem
+                            if (tok[0] && strncmp(tok, g_selfName, NAME_LEN) != 0) {
                                 auto& ne = g_nearby[std::string(tok)];
                                 ne.lastSeenTcpMs = tcpNow;
                             }
@@ -454,48 +464,67 @@ static const uint8_t FONT5x7[95][5] = {
     {0x08,0x08,0x2A,0x1C,0x08}, // 126 ~
 };
 
-// Desenha um caractere como pixels 2×2
+// Desenha um caractere como pixels 3×3 (maior, estilo L2)
 static void drawChar(IDirect3DDevice9* dev, float x, float y, char c, DWORD col) {
     if ((unsigned char)c < 32 || (unsigned char)c > 126) c = '?';
     const uint8_t* g = FONT5x7[(uint8_t)c - 32];
     for (int col_ = 0; col_ < 5; col_++) {
         for (int row = 0; row < 7; row++) {
             if (g[col_] & (1 << row))
-                fillRect(dev, x + col_*2.0f, y + row*2.0f, 2.0f, 2.0f, col);
+                fillRect(dev, x + col_*3.0f, y + row*3.0f, 3.0f, 3.0f, col);
         }
     }
 }
 
-// Desenha texto. Cada char ocupa 12px (5×2 + 1 espaço × 2)
+// Cada char ocupa 18px (5×3 + 3 gap)
 static void drawText(IDirect3DDevice9* dev, float x, float y, const char* text, DWORD col) {
-    // Sombra preta (offset 1px) para legibilidade em qualquer fundo
-    for (const char* p = text; *p; ++p, x += 12.0f) {
-        drawChar(dev, x + 1.0f, y + 1.0f, *p, D3DCOLOR_ARGB(180, 0, 0, 0));
+    for (const char* p = text; *p; ++p, x += 18.0f) {
+        drawChar(dev, x + 1.0f, y + 1.0f, *p, D3DCOLOR_ARGB(200, 0, 0, 0));
         drawChar(dev, x, y, *p, col);
     }
 }
 
-// Ícone de microfone (14×16 px)
+// Ícone de microfone escalado (~22×22 px)
 static void drawMic(IDirect3DDevice9* dev, float x, float y, DWORD col) {
-    fillRect(dev, x+3, y+0,  8.0f, 9.0f,  col); // corpo
-    fillRect(dev, x+6, y+9,  2.0f, 4.0f,  col); // haste
-    fillRect(dev, x+3, y+13, 8.0f, 2.0f,  col); // base
+    fillRect(dev, x+5,  y+0,  12.0f, 13.0f, col); // corpo
+    fillRect(dev, x+10, y+13, 3.0f,  6.0f,  col); // haste
+    fillRect(dev, x+5,  y+19, 12.0f, 3.0f,  col); // base
 }
 
 static constexpr float OX       = 10.0f;
-static constexpr float OY_SELF  = 40.0f;  // ícone próprio
-static constexpr float OY_LIST  = 62.0f;  // lista de jogadores
-static constexpr float ROW_H    = 22.0f;
-static constexpr float ROW_W    = 200.0f;
+static constexpr float OY_SELF  = 90.0f;  // ícone próprio
+static constexpr float OY_LIST  = 116.0f; // lista de jogadores
+static constexpr float ROW_H    = 32.0f;
+static constexpr float ROW_W    = 240.0f;
 static constexpr DWORD TALK_MS  = 600;
+
+// ── WndProc subclass (impede click de vazar para o jogo) ──────────────────────
+static LRESULT CALLBACK myWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_LBUTTONDOWN && g_run) {
+        int px = (int)(short)LOWORD(lp);
+        int py = (int)(short)HIWORD(lp);
+        if (px >= (int)OX && px < (int)(OX + ROW_W) && py >= (int)OY_LIST) {
+            int rows = 0;
+            { std::lock_guard<std::mutex> l(g_partyMtx);  rows += (int)g_party.size(); }
+            { std::lock_guard<std::mutex> l(g_nearbyMtx); rows += (int)g_nearby.size(); }
+            if (py < (int)(OY_LIST + rows * ROW_H))
+                return 0; // engole — não repassa para o jogo
+        }
+    }
+    return CallWindowProc(g_origWndProc, hwnd, msg, wp, lp);
+}
 
 static void drawVoiceOverlay(IDirect3DDevice9* dev) {
     if (FAILED(dev->TestCooperativeLevel())) return;
     DWORD now = GetTickCount();
 
-    // ── Obtém HWND para click detection ──────────────────────────────────────
+    // ── Obtém HWND e instala subclass na primeira vez ─────────────────────────
     D3DDEVICE_CREATION_PARAMETERS cp{};
     HWND hwnd = SUCCEEDED(dev->GetCreationParameters(&cp)) ? cp.hFocusWindow : nullptr;
+    if (hwnd && !g_gameHwnd) {
+        g_gameHwnd    = hwnd;
+        g_origWndProc = (WNDPROC)SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)myWndProc);
+    }
 
     // Click detection (dispara apenas na borda de descida)
     static bool s_lastBtn = false;
@@ -553,19 +582,20 @@ static void drawVoiceOverlay(IDirect3DDevice9* dev) {
     float oy = OY_LIST;
 
     auto drawRow = [&](float rowY, const char* name, bool talking, bool muted, bool& clickOut) {
-        DWORD micCol  = muted          ? D3DCOLOR_ARGB(220, 180, 40, 40)
-                      : talking        ? D3DCOLOR_ARGB(220, 50, 200, 50)
-                      :                  D3DCOLOR_ARGB(140, 110, 110, 110);
-        DWORD txtCol  = muted          ? D3DCOLOR_ARGB(255, 220, 60, 60)
-                      : talking        ? D3DCOLOR_ARGB(255, 60, 220, 60)
-                      :                  D3DCOLOR_ARGB(200, 160, 160, 160);
+        // Cores estilo L2: idle=dourado, falando=verde vivo, mutado=vermelho
+        DWORD micCol  = muted   ? D3DCOLOR_ARGB(230, 220, 55, 55)
+                      : talking ? D3DCOLOR_ARGB(255, 70, 230, 70)
+                      :           D3DCOLOR_ARGB(160, 160, 140, 90);
+        DWORD txtCol  = muted   ? D3DCOLOR_ARGB(255, 230, 70, 70)
+                      : talking ? D3DCOLOR_ARGB(255, 90, 240, 90)
+                      :           D3DCOLOR_ARGB(230, 220, 210, 170);
 
         // Fundo semitransparente
-        fillRect(dev, OX, rowY, ROW_W, ROW_H - 2, D3DCOLOR_ARGB(130, 8, 8, 8));
+        fillRect(dev, OX, rowY, ROW_W, ROW_H - 2, D3DCOLOR_ARGB(150, 5, 5, 5));
         // Microfone
-        drawMic(dev, OX + 2, rowY + 3, micCol);
-        // Nome (fonte pixel, sem GDI)
-        drawText(dev, OX + 20, rowY + 4, name, txtCol);
+        drawMic(dev, OX + 2, rowY + 4, micCol);
+        // Nome (fonte pixel 3×3)
+        drawText(dev, OX + 28, rowY + 6, name, txtCol);
 
         // Click em qualquer parte da linha → toggle mute
         if (clicked &&
@@ -733,6 +763,8 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
         g_run = true; std::thread(voiceInit).detach(); break;
     case DLL_PROCESS_DETACH:
         g_run = false;
+        if (g_gameHwnd && g_origWndProc)
+            SetWindowLongPtrA(g_gameHwnd, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
         if (g_waveIn) { waveInStop(g_waveIn); waveInReset(g_waveIn); waveInClose(g_waveIn); }
         if (g_udp != INVALID_SOCKET) closesocket(g_udp);
         if (g_tcp != INVALID_SOCKET) closesocket(g_tcp);

@@ -6,7 +6,7 @@ const dgram = require('dgram');
 const VOICE_PORT  = 7779;
 const VOICE_RANGE = 200;    // unidades L2 (proximidade geral)
 const PKT_AUDIO   = 1;
-const STALE_MS    = 10000;
+const STALE_MS    = 3000;
 const FRAME_BYTES = 1920;   // 960 samples * 2 bytes (48kHz mono, 20ms)
 const NAME_LEN    = 32;
 
