@@ -378,131 +378,118 @@ static void fillRect(IDirect3DDevice9* dev, float x, float y, float w, float h, 
     dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(PVert));
 }
 
-// Fonte 5×7 pixels. Cada char = 5 bytes (colunas), bit0=topo, bit6=base.
-// Fonte pública baseada no clássico Adafruit/Arduino 5x7 font (domínio público).
-static const uint8_t FONT5x7[95][5] = {
-    {0x00,0x00,0x00,0x00,0x00}, // 32 ' '
-    {0x00,0x00,0x5F,0x00,0x00}, // 33 !
-    {0x00,0x07,0x00,0x07,0x00}, // 34 "
-    {0x14,0x7F,0x14,0x7F,0x14}, // 35 #
-    {0x24,0x2A,0x7F,0x2A,0x12}, // 36 $
-    {0x23,0x13,0x08,0x64,0x62}, // 37 %
-    {0x36,0x49,0x55,0x22,0x50}, // 38 &
-    {0x00,0x05,0x03,0x00,0x00}, // 39 '
-    {0x00,0x1C,0x22,0x41,0x00}, // 40 (
-    {0x00,0x41,0x22,0x1C,0x00}, // 41 )
-    {0x08,0x2A,0x1C,0x2A,0x08}, // 42 *
-    {0x08,0x08,0x3E,0x08,0x08}, // 43 +
-    {0x00,0x50,0x30,0x00,0x00}, // 44 ,
-    {0x08,0x08,0x08,0x08,0x08}, // 45 -
-    {0x00,0x60,0x60,0x00,0x00}, // 46 .
-    {0x20,0x10,0x08,0x04,0x02}, // 47 /
-    {0x3E,0x51,0x49,0x45,0x3E}, // 48 0
-    {0x00,0x42,0x7F,0x40,0x00}, // 49 1
-    {0x42,0x61,0x51,0x49,0x46}, // 50 2
-    {0x21,0x41,0x45,0x4B,0x31}, // 51 3
-    {0x18,0x14,0x12,0x7F,0x10}, // 52 4
-    {0x27,0x45,0x45,0x45,0x39}, // 53 5
-    {0x3C,0x4A,0x49,0x49,0x30}, // 54 6
-    {0x01,0x71,0x09,0x05,0x03}, // 55 7
-    {0x36,0x49,0x49,0x49,0x36}, // 56 8
-    {0x06,0x49,0x49,0x29,0x1E}, // 57 9
-    {0x00,0x36,0x36,0x00,0x00}, // 58 :
-    {0x00,0x56,0x36,0x00,0x00}, // 59 ;
-    {0x00,0x08,0x14,0x22,0x41}, // 60 <
-    {0x14,0x14,0x14,0x14,0x14}, // 61 =
-    {0x41,0x22,0x14,0x08,0x00}, // 62 >
-    {0x02,0x01,0x51,0x09,0x06}, // 63 ?
-    {0x32,0x49,0x79,0x41,0x3E}, // 64 @
-    {0x7E,0x11,0x11,0x11,0x7E}, // 65 A
-    {0x7F,0x49,0x49,0x49,0x36}, // 66 B
-    {0x3E,0x41,0x41,0x41,0x22}, // 67 C
-    {0x7F,0x41,0x41,0x22,0x1C}, // 68 D
-    {0x7F,0x49,0x49,0x49,0x41}, // 69 E
-    {0x7F,0x09,0x09,0x01,0x01}, // 70 F
-    {0x3E,0x41,0x49,0x49,0x7A}, // 71 G
-    {0x7F,0x08,0x08,0x08,0x7F}, // 72 H
-    {0x00,0x41,0x7F,0x41,0x00}, // 73 I
-    {0x20,0x40,0x41,0x3F,0x01}, // 74 J
-    {0x7F,0x08,0x14,0x22,0x41}, // 75 K
-    {0x7F,0x40,0x40,0x40,0x40}, // 76 L
-    {0x7F,0x02,0x04,0x02,0x7F}, // 77 M
-    {0x7F,0x04,0x08,0x10,0x7F}, // 78 N
-    {0x3E,0x41,0x41,0x41,0x3E}, // 79 O
-    {0x7F,0x09,0x09,0x09,0x06}, // 80 P
-    {0x3E,0x41,0x51,0x21,0x5E}, // 81 Q
-    {0x7F,0x09,0x19,0x29,0x46}, // 82 R
-    {0x46,0x49,0x49,0x49,0x31}, // 83 S
-    {0x01,0x01,0x7F,0x01,0x01}, // 84 T
-    {0x3F,0x40,0x40,0x40,0x3F}, // 85 U
-    {0x1F,0x20,0x40,0x20,0x1F}, // 86 V
-    {0x3F,0x40,0x38,0x40,0x3F}, // 87 W
-    {0x63,0x14,0x08,0x14,0x63}, // 88 X
-    {0x07,0x08,0x70,0x08,0x07}, // 89 Y
-    {0x61,0x51,0x49,0x45,0x43}, // 90 Z
-    {0x00,0x7F,0x41,0x41,0x00}, // 91 [
-    {0x02,0x04,0x08,0x10,0x20}, // 92 backslash
-    {0x00,0x41,0x41,0x7F,0x00}, // 93 ]
-    {0x04,0x02,0x01,0x02,0x04}, // 94 ^
-    {0x40,0x40,0x40,0x40,0x40}, // 95 _
-    {0x00,0x01,0x02,0x04,0x00}, // 96 `
-    {0x20,0x54,0x54,0x54,0x78}, // 97 a
-    {0x7F,0x48,0x44,0x44,0x38}, // 98 b
-    {0x38,0x44,0x44,0x44,0x20}, // 99 c
-    {0x38,0x44,0x44,0x48,0x7F}, // 100 d
-    {0x38,0x54,0x54,0x54,0x18}, // 101 e
-    {0x08,0x7E,0x09,0x01,0x02}, // 102 f
-    {0x0C,0x52,0x52,0x52,0x3E}, // 103 g
-    {0x7F,0x08,0x04,0x04,0x78}, // 104 h
-    {0x00,0x44,0x7D,0x40,0x00}, // 105 i
-    {0x20,0x40,0x44,0x3D,0x00}, // 106 j
-    {0x7F,0x10,0x28,0x44,0x00}, // 107 k
-    {0x00,0x41,0x7F,0x40,0x00}, // 108 l
-    {0x7C,0x04,0x18,0x04,0x78}, // 109 m
-    {0x7C,0x08,0x04,0x04,0x78}, // 110 n
-    {0x38,0x44,0x44,0x44,0x38}, // 111 o
-    {0x7C,0x14,0x14,0x14,0x08}, // 112 p
-    {0x08,0x14,0x14,0x18,0x7C}, // 113 q
-    {0x7C,0x08,0x04,0x04,0x08}, // 114 r
-    {0x48,0x54,0x54,0x54,0x20}, // 115 s
-    {0x04,0x3F,0x44,0x40,0x20}, // 116 t
-    {0x3C,0x40,0x40,0x20,0x7C}, // 117 u
-    {0x1C,0x20,0x40,0x20,0x1C}, // 118 v
-    {0x3C,0x40,0x30,0x40,0x3C}, // 119 w
-    {0x44,0x28,0x10,0x28,0x44}, // 120 x
-    {0x0C,0x50,0x50,0x50,0x3C}, // 121 y
-    {0x44,0x64,0x54,0x4C,0x44}, // 122 z
-    {0x00,0x08,0x36,0x41,0x00}, // 123 {
-    {0x00,0x00,0x7F,0x00,0x00}, // 124 |
-    {0x00,0x41,0x36,0x08,0x00}, // 125 }
-    {0x08,0x08,0x2A,0x1C,0x08}, // 126 ~
-};
+// ── Texto GDI → textura D3D9 (fonte ClearType real, sem pixel-art) ──────────
+struct GlyphTex { IDirect3DTexture9* tex = nullptr; int w = 0, h = 0; };
+static std::unordered_map<std::string, GlyphTex> g_glyphCache;
+static std::mutex g_glyphMtx;
 
-// Desenha um caractere como pixels 3×3 (maior, estilo L2)
-static void drawChar(IDirect3DDevice9* dev, float x, float y, char c, DWORD col) {
-    if ((unsigned char)c < 32 || (unsigned char)c > 126) c = '?';
-    const uint8_t* g = FONT5x7[(uint8_t)c - 32];
-    for (int col_ = 0; col_ < 5; col_++) {
-        for (int row = 0; row < 7; row++) {
-            if (g[col_] & (1 << row))
-                fillRect(dev, x + col_*3.0f, y + row*3.0f, 3.0f, 3.0f, col);
+static GlyphTex makeTextTex(IDirect3DDevice9* dev, const char* text, DWORD argb) {
+    GlyphTex out{};
+    int len = (int)strlen(text);
+    if (!len) return out;
+    const int FS = 16; // tamanho da fonte px
+    // Mede largura
+    HDC hdcTmp = CreateCompatibleDC(nullptr);
+    HFONT hfTmp = CreateFontA(FS, 0,0,0, FW_BOLD,0,0,0, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        VARIABLE_PITCH|FF_SWISS, "Tahoma");
+    SelectObject(hdcTmp, hfTmp);
+    SIZE sz{}; GetTextExtentPoint32A(hdcTmp, text, len, &sz);
+    DeleteObject(hfTmp); DeleteDC(hdcTmp);
+    int W = sz.cx + 6, H = sz.cy + 4;
+    // Cria DIB 32bpp
+    BITMAPINFO bmi{}; auto& bh = bmi.bmiHeader;
+    bh.biSize=sizeof(bh); bh.biWidth=W; bh.biHeight=-H;
+    bh.biPlanes=1; bh.biBitCount=32; bh.biCompression=BI_RGB;
+    void* bits = nullptr;
+    HDC hdc = CreateCompatibleDC(nullptr);
+    HBITMAP hbm = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!hbm) { DeleteDC(hdc); return out; }
+    SelectObject(hdc, hbm);
+    memset(bits, 0, W * H * 4);
+    HFONT hFont = CreateFontA(FS, 0,0,0, FW_BOLD,0,0,0, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        VARIABLE_PITCH|FF_SWISS, "Tahoma");
+    HGDIOBJ hOld = SelectObject(hdc, hFont);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(0,0,0));   TextOutA(hdc, 2, 2, text, len); // sombra
+    SetTextColor(hdc, RGB((argb>>16)&0xFF,(argb>>8)&0xFF,argb&0xFF));
+    TextOutA(hdc, 1, 1, text, len);  // texto principal
+    GdiFlush();
+    SelectObject(hdc, hOld); DeleteObject(hFont); DeleteDC(hdc);
+    // DIB → textura D3D9
+    IDirect3DTexture9* tex = nullptr;
+    if (SUCCEEDED(dev->CreateTexture(W,H,1,0,D3DFMT_A8R8G8B8,D3DPOOL_MANAGED,&tex,nullptr))) {
+        D3DLOCKED_RECT lr;
+        if (SUCCEEDED(tex->LockRect(0,&lr,nullptr,0))) {
+            BYTE sa = (argb>>24)&0xFF;
+            auto* src = (DWORD*)bits;
+            for (int y=0;y<H;y++) {
+                auto* dst = (DWORD*)((BYTE*)lr.pBits + y*lr.Pitch);
+                for (int x=0;x<W;x++) {
+                    DWORD px=src[y*W+x];
+                    BYTE r=(px>>16)&0xFF, g=(px>>8)&0xFF, b=px&0xFF;
+                    BYTE bright=(BYTE)(((int)r+g+b)/3);
+                    dst[x]=D3DCOLOR_ARGB((bright*sa)/255, r, g, b);
+                }
+            }
+            tex->UnlockRect(0);
         }
+        out.tex=tex; out.w=W; out.h=H;
     }
+    DeleteObject(hbm);
+    return out;
 }
 
-// Cada char ocupa 18px (5×3 + 3 gap)
-static void drawText(IDirect3DDevice9* dev, float x, float y, const char* text, DWORD col) {
-    for (const char* p = text; *p; ++p, x += 18.0f) {
-        drawChar(dev, x + 1.0f, y + 1.0f, *p, D3DCOLOR_ARGB(200, 0, 0, 0));
-        drawChar(dev, x, y, *p, col);
+static void drawText(IDirect3DDevice9* dev, float x, float y, const char* text, DWORD argb) {
+    char key[48]; snprintf(key, sizeof(key), "%.31s_%08X", text, argb);
+    GlyphTex* gt = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_glyphMtx);
+        auto it = g_glyphCache.find(key);
+        if (it == g_glyphCache.end()) {
+            GlyphTex ng = makeTextTex(dev, text, argb);
+            if (!ng.tex) return;
+            g_glyphCache[key] = ng;
+        }
+        gt = &g_glyphCache[key];
     }
+    if (!gt || !gt->tex) return;
+    // Renderiza quad texturizado
+    dev->SetTexture(0, gt->tex);
+    dev->SetTextureStageState(0, D3DTSS_COLOROP,   D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    float w=(float)gt->w, h=(float)gt->h;
+    struct PVT { float x,y,z,rhw; DWORD c; float u,v; };
+    PVT v[]={{x,y,0,1,0xFFFFFFFF,0,0},{x+w,y,0,1,0xFFFFFFFF,1,0},
+             {x,y+h,0,1,0xFFFFFFFF,0,1},{x+w,y+h,0,1,0xFFFFFFFF,1,1}};
+    dev->SetFVF(D3DFVF_XYZRHW|D3DFVF_DIFFUSE|D3DFVF_TEX1);
+    dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP,2,v,sizeof(PVT));
+    // Restaura estado sem textura
+    dev->SetTexture(0, nullptr);
+    dev->SetFVF(D3DFVF_XYZRHW|D3DFVF_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_COLOROP,   D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
 }
 
-// Ícone de microfone escalado (~22×22 px)
+// Ícone de microfone com forma arredondada (~16×21 px)
 static void drawMic(IDirect3DDevice9* dev, float x, float y, DWORD col) {
-    fillRect(dev, x+5,  y+0,  12.0f, 13.0f, col); // corpo
-    fillRect(dev, x+10, y+13, 3.0f,  6.0f,  col); // haste
-    fillRect(dev, x+5,  y+19, 12.0f, 3.0f,  col); // base
+    // Corpo arredondado
+    fillRect(dev, x+4, y+0,  8, 1, col);
+    fillRect(dev, x+2, y+1,  12,1, col);
+    fillRect(dev, x+1, y+2,  14,9, col);
+    fillRect(dev, x+2, y+11, 12,1, col);
+    fillRect(dev, x+4, y+12, 8, 1, col);
+    // Haste
+    fillRect(dev, x+7, y+13, 2, 4, col);
+    // Arco U: esq + dir + base
+    fillRect(dev, x+1, y+13, 5, 2, col);
+    fillRect(dev, x+10,y+13, 5, 2, col);
+    fillRect(dev, x+1, y+18, 14,2, col);
 }
 
 static constexpr float OX       = 10.0f;
@@ -611,8 +598,8 @@ static void drawVoiceOverlay(IDirect3DDevice9* dev) {
         fillRect(dev, OX, rowY, ROW_W, ROW_H - 2, D3DCOLOR_ARGB(150, 5, 5, 5));
         // Microfone
         drawMic(dev, OX + 2, rowY + 4, micCol);
-        // Nome (fonte pixel 3×3)
-        drawText(dev, OX + 28, rowY + 6, name, txtCol);
+        // Nome (fonte ClearType via GDI)
+        drawText(dev, OX + 26, rowY + 7, name, txtCol);
 
         // Click em qualquer parte da linha → toggle mute
         if (clicked &&
@@ -781,6 +768,7 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
     case DLL_PROCESS_DETACH:
         g_run = false;
         if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+        { std::lock_guard<std::mutex> lk(g_glyphMtx); for (auto& [k,g] : g_glyphCache) if (g.tex) g.tex->Release(); g_glyphCache.clear(); }
         if (g_waveIn) { waveInStop(g_waveIn); waveInReset(g_waveIn); waveInClose(g_waveIn); }
         if (g_udp != INVALID_SOCKET) closesocket(g_udp);
         if (g_tcp != INVALID_SOCKET) closesocket(g_tcp);
