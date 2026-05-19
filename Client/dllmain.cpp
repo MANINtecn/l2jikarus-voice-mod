@@ -108,6 +108,7 @@ static int16_t  g_capBuf[CAPTURE_BUFS][FRAME_SAMPLES];
 struct Speaker {
     HWAVEOUT hOut = nullptr;
     std::mutex mtx;
+    std::atomic<int> queued{0}; // frames pendentes no waveOut
     ~Speaker() { if (hOut) { waveOutReset(hOut); waveOutClose(hOut); } }
 };
 static std::unordered_map<uint32_t, Speaker*> g_speakers;
@@ -180,9 +181,12 @@ static Speaker* getSpeaker(uint32_t id) {
 static void playAudio(uint32_t id, float vol, const int16_t* samples) {
     Speaker* s = getSpeaker(id);
     if (!s || !s->hOut) return;
+    // Máximo 2 frames na fila (40ms). Descarta se acumulou — evita "áudio acelerado"
+    if (s->queued.load() >= 2) return;
+    s->queued++;
     auto* buf = new int16_t[FRAME_SAMPLES];
     for (int i = 0; i < FRAME_SAMPLES; i++) {
-        float v = samples[i] * vol * 2.0f; // boost 2x (era 4x — reduziu distorção)
+        float v = samples[i] * vol * 2.0f;
         if (v >  32767.f) v =  32767.f;
         if (v < -32768.f) v = -32768.f;
         buf[i] = (int16_t)v;
@@ -195,6 +199,7 @@ static void playAudio(uint32_t id, float vol, const int16_t* samples) {
         while (!(hdr->dwFlags & WHDR_DONE)) Sleep(1);
         waveOutUnprepareHeader(s->hOut, hdr, sizeof(WAVEHDR));
         delete[] (int16_t*)hdr->dwUser; delete hdr;
+        s->queued--;
     }).detach();
 }
 
@@ -476,20 +481,20 @@ static void drawText(IDirect3DDevice9* dev, float x, float y, const char* text, 
     dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
 }
 
-// Ícone de microfone com forma arredondada (~16×21 px)
+// Ícone de microfone fino (~12×20 px)
 static void drawMic(IDirect3DDevice9* dev, float x, float y, DWORD col) {
-    // Corpo arredondado
-    fillRect(dev, x+4, y+0,  8, 1, col);
-    fillRect(dev, x+2, y+1,  12,1, col);
-    fillRect(dev, x+1, y+2,  14,9, col);
-    fillRect(dev, x+2, y+11, 12,1, col);
-    fillRect(dev, x+4, y+12, 8, 1, col);
+    // Corpo arredondado mais fino
+    fillRect(dev, x+3, y+0,  6, 1, col);
+    fillRect(dev, x+2, y+1,  8, 1, col);
+    fillRect(dev, x+1, y+2,  10,9, col);
+    fillRect(dev, x+2, y+11, 8, 1, col);
+    fillRect(dev, x+3, y+12, 6, 1, col);
     // Haste
-    fillRect(dev, x+7, y+13, 2, 4, col);
+    fillRect(dev, x+5, y+13, 2, 4, col);
     // Arco U: esq + dir + base
-    fillRect(dev, x+1, y+13, 5, 2, col);
-    fillRect(dev, x+10,y+13, 5, 2, col);
-    fillRect(dev, x+1, y+18, 14,2, col);
+    fillRect(dev, x+1, y+13, 3, 2, col);
+    fillRect(dev, x+8, y+13, 3, 2, col);
+    fillRect(dev, x+1, y+17, 10,2, col);
 }
 
 static constexpr float OX       = 10.0f;
