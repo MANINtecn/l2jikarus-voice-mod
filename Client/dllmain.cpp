@@ -1,6 +1,5 @@
 // L2 Samurai Crow — Native Voice Chat (dinput8.dll proxy)
 // Carrega automático com L2.exe. Zero software extra para o jogador.
-// Overlay desenhado via hook D3D9 Present — aparece dentro do jogo.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -15,7 +14,6 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
-#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -25,11 +23,12 @@
 #pragma comment(lib, "winmm.lib")
 
 // ── Áudio ─────────────────────────────────────────────────────────────────────
-static constexpr int   SAMPLE_RATE   = 16000;
+// 48kHz nativo evita resample do Windows (maioria dos devices roda 48kHz)
+static constexpr int   SAMPLE_RATE   = 48000;
 static constexpr int   CHANNELS      = 1;
 static constexpr int   BITS          = 16;
-static constexpr int   FRAME_SAMPLES = 320;    // 20ms a 16kHz
-static constexpr int   FRAME_BYTES   = FRAME_SAMPLES * 2;
+static constexpr int   FRAME_SAMPLES = 960;     // 20ms a 48kHz
+static constexpr int   FRAME_BYTES   = FRAME_SAMPLES * 2; // 1920
 static constexpr int   CAPTURE_BUFS  = 4;
 static float           g_vadThreshold = 400.0f;
 
@@ -39,8 +38,8 @@ static constexpr int      VOICE_PORT_UDP = 7779;
 static constexpr int      POS_PORT_TCP   = 7778;
 static constexpr int      NAME_LEN       = 32;
 
-// OutPacket: type(4)+x(4)+y(4)+z(4)+partyId(4)+name(32)+samples(640) = 692
-// InPacket : speakerId(4)+volumeFactor(4)+name(32)+samples(640)       = 680
+// OutPacket: type(4)+x(4)+y(4)+z(4)+partyId(4)+name(32)+samples(1920) = 1972
+// InPacket : speakerId(4)+volumeFactor(4)+name(32)+samples(1920)       = 1960
 #pragma pack(push, 1)
 struct OutPacket {
     uint32_t type;
@@ -70,24 +69,23 @@ HRESULT WINAPI DirectInput8Create(HINSTANCE h, DWORD v, REFIID r, LPVOID* p, LPU
 // ── Speaker tracking ──────────────────────────────────────────────────────────
 struct PartyMember {
     char  name[NAME_LEN];
-    DWORD lastTalkMs;   // 0 = nunca falou
+    DWORD lastTalkMs;
     bool  muted;
-    float rowY;         // posição Y na tela (atualizado a cada frame)
+    float rowY;
 };
 struct NearbyEntry {
-    uint32_t id;
-    char     name[NAME_LEN];
-    DWORD    lastTalkMs;
+    uint32_t speakerId;      // 0 se ainda não falou (presente só por TCP)
+    DWORD    lastTalkMs;     // último áudio UDP recebido
+    DWORD    lastSeenTcpMs;  // última vez no NEARBY: do servidor
     bool     muted;
     float    rowY;
 };
 
-static std::vector<PartyMember>                  g_party;
-static std::mutex                                g_partyMtx;
-static std::unordered_map<uint32_t, NearbyEntry> g_nearby;
-static std::mutex                                g_nearbyMtx;
+static std::vector<PartyMember>                     g_party;
+static std::mutex                                   g_partyMtx;
+static std::unordered_map<std::string, NearbyEntry> g_nearby; // chave = nome
+static std::mutex                                   g_nearbyMtx;
 
-// Dados do jogador local (vindos do TCP)
 static char     g_selfName[NAME_LEN] = {};
 static uint32_t g_selfPartyId = 0;
 
@@ -95,6 +93,7 @@ static uint32_t g_selfPartyId = 0;
 static HMODULE           g_dllModule = nullptr;
 static std::atomic<bool> g_run       { false };
 static std::atomic<bool> g_muted     { false };
+static std::atomic<DWORD> g_txTick   { 0 };
 
 static SOCKET     g_udp = INVALID_SOCKET;
 static SOCKET     g_tcp = INVALID_SOCKET;
@@ -102,12 +101,10 @@ static sockaddr_in g_serverAddr{};
 
 static std::atomic<float> g_posX{0}, g_posY{0}, g_posZ{0};
 
-// Captura
 static HWAVEIN  g_waveIn = nullptr;
 static WAVEHDR  g_capHdr[CAPTURE_BUFS];
 static int16_t  g_capBuf[CAPTURE_BUFS][FRAME_SAMPLES];
 
-// Reprodução: um HWAVEOUT por speakerId
 struct Speaker {
     HWAVEOUT hOut = nullptr;
     std::mutex mtx;
@@ -118,7 +115,7 @@ static std::mutex                              g_spkMtx;
 
 typedef HRESULT(WINAPI* Present_t)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 
-// ── Log de debug ──────────────────────────────────────────────────────────────
+// ── Log ───────────────────────────────────────────────────────────────────────
 static std::string g_logPath;
 static std::mutex  g_logMtx;
 
@@ -127,8 +124,7 @@ static void dbgLog(const char* fmt, ...) {
     char msg[512];
     va_list a; va_start(a, fmt); vsnprintf(msg, sizeof(msg), fmt, a); va_end(a);
     std::lock_guard<std::mutex> lk(g_logMtx);
-    FILE* f = nullptr;
-    fopen_s(&f, g_logPath.c_str(), "a");
+    FILE* f = nullptr; fopen_s(&f, g_logPath.c_str(), "a");
     if (f) {
         SYSTEMTIME st; GetLocalTime(&st);
         fprintf(f, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, msg);
@@ -136,7 +132,7 @@ static void dbgLog(const char* fmt, ...) {
     }
 }
 
-// ── voice_config.ini ──────────────────────────────────────────────────────────
+// ── Configuração ──────────────────────────────────────────────────────────────
 static std::string cfgGet(const char* key, const char* def) {
     char path[MAX_PATH], buf[256];
     GetModuleFileNameA(nullptr, path, MAX_PATH);
@@ -182,7 +178,7 @@ static void playAudio(uint32_t id, float vol, const int16_t* samples) {
     if (!s || !s->hOut) return;
     auto* buf = new int16_t[FRAME_SAMPLES];
     for (int i = 0; i < FRAME_SAMPLES; i++) {
-        float v = samples[i] * vol * 4.0f;
+        float v = samples[i] * vol * 2.0f; // boost 2x (era 4x — reduziu distorção)
         if (v >  32767.f) v =  32767.f;
         if (v < -32768.f) v = -32768.f;
         buf[i] = (int16_t)v;
@@ -207,10 +203,11 @@ static void recvThread() {
         if (n != (int)sizeof(InPacket)) continue;
         pkt.name[NAME_LEN - 1] = '\0';
 
-        bool isMuted  = false;
-        bool isParty  = false;
+        // Ignora o próprio áudio (evita echo em teste com 2 contas)
+        if (g_selfName[0] && strncmp(pkt.name, g_selfName, NAME_LEN) == 0) continue;
 
-        // Verifica party
+        bool isMuted = false, isParty = false;
+
         {
             std::lock_guard<std::mutex> lk(g_partyMtx);
             for (auto& pm : g_party) {
@@ -222,24 +219,14 @@ static void recvThread() {
                 }
             }
         }
-
-        // Se não é party, rastreia como próximo
         if (!isParty) {
             std::lock_guard<std::mutex> lk(g_nearbyMtx);
-            auto it = g_nearby.find(pkt.speakerId);
-            if (it == g_nearby.end()) {
-                NearbyEntry ne{};
-                ne.id = pkt.speakerId;
-                strncpy_s(ne.name, pkt.name, NAME_LEN - 1);
-                ne.lastTalkMs = GetTickCount();
-                g_nearby[pkt.speakerId] = ne;
-            } else {
-                it->second.lastTalkMs = GetTickCount();
-                strncpy_s(it->second.name, pkt.name, NAME_LEN - 1);
-                isMuted = it->second.muted;
-            }
+            std::string key(pkt.name);
+            auto& ne = g_nearby[key];
+            ne.speakerId  = pkt.speakerId;
+            ne.lastTalkMs = GetTickCount();
+            isMuted       = ne.muted;
         }
-
         if (!isMuted && !g_muted.load())
             playAudio(pkt.speakerId, pkt.volumeFactor, pkt.samples);
     }
@@ -260,6 +247,7 @@ static void CALLBACK waveInCb(HWAVEIN, UINT msg, DWORD_PTR, DWORD_PTR p1, DWORD_
             strncpy_s(pkt.name, g_selfName, NAME_LEN - 1);
             memcpy(pkt.samples, samples, FRAME_BYTES);
             sendto(g_udp, (const char*)&pkt, sizeof(pkt), 0, (sockaddr*)&g_serverAddr, sizeof(g_serverAddr));
+            g_txTick = GetTickCount();
         }
     }
     waveInAddBuffer(g_waveIn, hdr, sizeof(WAVEHDR));
@@ -268,7 +256,6 @@ static void CALLBACK waveInCb(HWAVEIN, UINT msg, DWORD_PTR, DWORD_PTR p1, DWORD_
 // ── posThread ─────────────────────────────────────────────────────────────────
 static void posThread() {
     std::string ip = cfgGet("ServerIP", "127.0.0.1");
-    dbgLog("posThread: %s:%d", ip.c_str(), POS_PORT_TCP);
     while (g_run) {
         g_tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(POS_PORT_TCP);
@@ -285,76 +272,67 @@ static void posThread() {
             size_t nl;
             while ((nl = buf.find('\n')) != std::string::npos) {
                 std::string line = buf.substr(0, nl); buf = buf.substr(nl + 1);
-
-                // SELF:nome:x,y,z
                 if (line.rfind("SELF:", 0) == 0) {
                     const char* p = line.c_str() + 5;
                     const char* colon = strchr(p, ':');
                     if (colon) {
-                        size_t nameLen = (size_t)(colon - p);
-                        if (nameLen >= NAME_LEN) nameLen = NAME_LEN - 1;
-                        strncpy_s(g_selfName, p, nameLen);
-                        g_selfName[nameLen] = '\0';
+                        size_t len = (size_t)(colon - p); if (len >= NAME_LEN) len = NAME_LEN - 1;
+                        strncpy_s(g_selfName, p, len); g_selfName[len] = '\0';
                         float x, y, z;
-                        if (sscanf_s(colon + 1, "%f,%f,%f", &x, &y, &z) == 3)
-                            g_posX = x, g_posY = y, g_posZ = z;
+                        if (sscanf_s(colon + 1, "%f,%f,%f", &x, &y, &z) == 3) g_posX=x,g_posY=y,g_posZ=z;
                     } else {
                         float x, y, z;
-                        if (sscanf_s(p, "%f,%f,%f", &x, &y, &z) == 3)
-                            g_posX = x, g_posY = y, g_posZ = z;
+                        if (sscanf_s(p, "%f,%f,%f", &x, &y, &z) == 3) g_posX=x,g_posY=y,g_posZ=z;
                     }
-                }
-
-                // PARTY:partyId:nome1;nome2;...  ou  PARTY: (sem party)
-                else if (line.rfind("PARTY:", 0) == 0) {
+                } else if (line.rfind("NEARBY:", 0) == 0) {
+                    const char* p = line.c_str() + 7;
+                    std::lock_guard<std::mutex> lk(g_nearbyMtx);
+                    DWORD tcpNow = GetTickCount();
+                    if (*p && *p != '\r' && *p != '\n') {
+                        char tmp2[1024]; strncpy_s(tmp2, p, sizeof(tmp2) - 1);
+                        char* ctx2 = nullptr; char* tok = strtok_s(tmp2, ";", &ctx2);
+                        while (tok && tok[0]) {
+                            char* colon = strchr(tok, ':');
+                            if (colon) *colon = '\0'; // extrai só o nome
+                            if (tok[0]) {
+                                auto& ne = g_nearby[std::string(tok)];
+                                ne.lastSeenTcpMs = tcpNow;
+                            }
+                            tok = strtok_s(nullptr, ";", &ctx2);
+                        }
+                    }
+                } else if (line.rfind("PARTY:", 0) == 0) {
                     const char* p = line.c_str() + 6;
                     const char* colon = strchr(p, ':');
-
                     std::lock_guard<std::mutex> lk(g_partyMtx);
                     if (colon && colon > p) {
                         g_selfPartyId = (uint32_t)atoi(p);
-                        const char* nameList = colon + 1;
-
-                        // Reconstrói lista preservando flags de mute
                         std::vector<PartyMember> newParty;
-                        char tmp2[512];
-                        strncpy_s(tmp2, nameList, sizeof(tmp2) - 1);
-                        char* ctx = nullptr;
-                        char* tok = strtok_s(tmp2, ";", &ctx);
+                        char tmp2[512]; strncpy_s(tmp2, colon + 1, sizeof(tmp2) - 1);
+                        char* ctx = nullptr; char* tok = strtok_s(tmp2, ";", &ctx);
                         while (tok && tok[0]) {
-                            PartyMember pm{};
-                            strncpy_s(pm.name, tok, NAME_LEN - 1);
-                            // Preserva mute e lastTalk de entrada anterior
-                            for (const auto& old : g_party) {
-                                if (strncmp(old.name, pm.name, NAME_LEN) == 0) {
-                                    pm.muted     = old.muted;
-                                    pm.lastTalkMs = old.lastTalkMs;
-                                    break;
-                                }
-                            }
+                            PartyMember pm{}; strncpy_s(pm.name, tok, NAME_LEN - 1);
+                            for (const auto& old : g_party)
+                                if (strncmp(old.name, pm.name, NAME_LEN) == 0) { pm.muted = old.muted; pm.lastTalkMs = old.lastTalkMs; break; }
                             newParty.push_back(pm);
                             tok = strtok_s(nullptr, ";", &ctx);
                         }
                         g_party = std::move(newParty);
-                    } else {
-                        g_selfPartyId = 0;
-                        g_party.clear();
-                    }
+                    } else { g_selfPartyId = 0; g_party.clear(); }
                 }
             }
         }
-        closesocket(g_tcp); dbgLog("posThread: desconectado");
-        if (g_run) Sleep(1000);
+        closesocket(g_tcp); if (g_run) Sleep(1000);
     }
 }
 
-// ── startCapture ──────────────────────────────────────────────────────────────
+// ── Captura ───────────────────────────────────────────────────────────────────
 static void startCapture() {
     WAVEFORMATEX wfx = makeWfx();
     if (waveInOpen(&g_waveIn, WAVE_MAPPER, &wfx, (DWORD_PTR)waveInCb, 0, CALLBACK_FUNCTION) != MMSYSERR_NOERROR) {
         dbgLog("waveInOpen FALHOU"); return;
     }
-    dbgLog("waveInOpen OK");
+    dbgLog("waveInOpen OK 48kHz");
     for (int i = 0; i < CAPTURE_BUFS; i++) {
         ZeroMemory(&g_capHdr[i], sizeof(WAVEHDR));
         g_capHdr[i].lpData = (LPSTR)g_capBuf[i]; g_capHdr[i].dwBufferLength = FRAME_BYTES;
@@ -365,7 +343,7 @@ static void startCapture() {
     dbgLog("captura iniciada VAD=%.0f", g_vadThreshold);
 }
 
-// ── D3D9 overlay ──────────────────────────────────────────────────────────────
+// ── Overlay D3D9 com fonte pixel ──────────────────────────────────────────────
 struct PVert { float x, y, z, rhw; DWORD color; };
 
 static void fillRect(IDirect3DDevice9* dev, float x, float y, float w, float h, DWORD col) {
@@ -376,31 +354,162 @@ static void fillRect(IDirect3DDevice9* dev, float x, float y, float w, float h, 
     dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(PVert));
 }
 
-// Ícone de microfone pequeno (14×16 px)
-static void drawMic(IDirect3DDevice9* dev, float x, float y, DWORD col) {
-    fillRect(dev, x+3,  y+0,  8.0f, 9.0f,  col); // corpo
-    fillRect(dev, x+6,  y+9,  2.0f, 4.0f,  col); // haste
-    fillRect(dev, x+3,  y+13, 8.0f, 2.0f,  col); // base
+// Fonte 5×7 pixels. Cada char = 5 bytes (colunas), bit0=topo, bit6=base.
+// Fonte pública baseada no clássico Adafruit/Arduino 5x7 font (domínio público).
+static const uint8_t FONT5x7[95][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, // 32 ' '
+    {0x00,0x00,0x5F,0x00,0x00}, // 33 !
+    {0x00,0x07,0x00,0x07,0x00}, // 34 "
+    {0x14,0x7F,0x14,0x7F,0x14}, // 35 #
+    {0x24,0x2A,0x7F,0x2A,0x12}, // 36 $
+    {0x23,0x13,0x08,0x64,0x62}, // 37 %
+    {0x36,0x49,0x55,0x22,0x50}, // 38 &
+    {0x00,0x05,0x03,0x00,0x00}, // 39 '
+    {0x00,0x1C,0x22,0x41,0x00}, // 40 (
+    {0x00,0x41,0x22,0x1C,0x00}, // 41 )
+    {0x08,0x2A,0x1C,0x2A,0x08}, // 42 *
+    {0x08,0x08,0x3E,0x08,0x08}, // 43 +
+    {0x00,0x50,0x30,0x00,0x00}, // 44 ,
+    {0x08,0x08,0x08,0x08,0x08}, // 45 -
+    {0x00,0x60,0x60,0x00,0x00}, // 46 .
+    {0x20,0x10,0x08,0x04,0x02}, // 47 /
+    {0x3E,0x51,0x49,0x45,0x3E}, // 48 0
+    {0x00,0x42,0x7F,0x40,0x00}, // 49 1
+    {0x42,0x61,0x51,0x49,0x46}, // 50 2
+    {0x21,0x41,0x45,0x4B,0x31}, // 51 3
+    {0x18,0x14,0x12,0x7F,0x10}, // 52 4
+    {0x27,0x45,0x45,0x45,0x39}, // 53 5
+    {0x3C,0x4A,0x49,0x49,0x30}, // 54 6
+    {0x01,0x71,0x09,0x05,0x03}, // 55 7
+    {0x36,0x49,0x49,0x49,0x36}, // 56 8
+    {0x06,0x49,0x49,0x29,0x1E}, // 57 9
+    {0x00,0x36,0x36,0x00,0x00}, // 58 :
+    {0x00,0x56,0x36,0x00,0x00}, // 59 ;
+    {0x00,0x08,0x14,0x22,0x41}, // 60 <
+    {0x14,0x14,0x14,0x14,0x14}, // 61 =
+    {0x41,0x22,0x14,0x08,0x00}, // 62 >
+    {0x02,0x01,0x51,0x09,0x06}, // 63 ?
+    {0x32,0x49,0x79,0x41,0x3E}, // 64 @
+    {0x7E,0x11,0x11,0x11,0x7E}, // 65 A
+    {0x7F,0x49,0x49,0x49,0x36}, // 66 B
+    {0x3E,0x41,0x41,0x41,0x22}, // 67 C
+    {0x7F,0x41,0x41,0x22,0x1C}, // 68 D
+    {0x7F,0x49,0x49,0x49,0x41}, // 69 E
+    {0x7F,0x09,0x09,0x01,0x01}, // 70 F
+    {0x3E,0x41,0x49,0x49,0x7A}, // 71 G
+    {0x7F,0x08,0x08,0x08,0x7F}, // 72 H
+    {0x00,0x41,0x7F,0x41,0x00}, // 73 I
+    {0x20,0x40,0x41,0x3F,0x01}, // 74 J
+    {0x7F,0x08,0x14,0x22,0x41}, // 75 K
+    {0x7F,0x40,0x40,0x40,0x40}, // 76 L
+    {0x7F,0x02,0x04,0x02,0x7F}, // 77 M
+    {0x7F,0x04,0x08,0x10,0x7F}, // 78 N
+    {0x3E,0x41,0x41,0x41,0x3E}, // 79 O
+    {0x7F,0x09,0x09,0x09,0x06}, // 80 P
+    {0x3E,0x41,0x51,0x21,0x5E}, // 81 Q
+    {0x7F,0x09,0x19,0x29,0x46}, // 82 R
+    {0x46,0x49,0x49,0x49,0x31}, // 83 S
+    {0x01,0x01,0x7F,0x01,0x01}, // 84 T
+    {0x3F,0x40,0x40,0x40,0x3F}, // 85 U
+    {0x1F,0x20,0x40,0x20,0x1F}, // 86 V
+    {0x3F,0x40,0x38,0x40,0x3F}, // 87 W
+    {0x63,0x14,0x08,0x14,0x63}, // 88 X
+    {0x07,0x08,0x70,0x08,0x07}, // 89 Y
+    {0x61,0x51,0x49,0x45,0x43}, // 90 Z
+    {0x00,0x7F,0x41,0x41,0x00}, // 91 [
+    {0x02,0x04,0x08,0x10,0x20}, // 92 backslash
+    {0x00,0x41,0x41,0x7F,0x00}, // 93 ]
+    {0x04,0x02,0x01,0x02,0x04}, // 94 ^
+    {0x40,0x40,0x40,0x40,0x40}, // 95 _
+    {0x00,0x01,0x02,0x04,0x00}, // 96 `
+    {0x20,0x54,0x54,0x54,0x78}, // 97 a
+    {0x7F,0x48,0x44,0x44,0x38}, // 98 b
+    {0x38,0x44,0x44,0x44,0x20}, // 99 c
+    {0x38,0x44,0x44,0x48,0x7F}, // 100 d
+    {0x38,0x54,0x54,0x54,0x18}, // 101 e
+    {0x08,0x7E,0x09,0x01,0x02}, // 102 f
+    {0x0C,0x52,0x52,0x52,0x3E}, // 103 g
+    {0x7F,0x08,0x04,0x04,0x78}, // 104 h
+    {0x00,0x44,0x7D,0x40,0x00}, // 105 i
+    {0x20,0x40,0x44,0x3D,0x00}, // 106 j
+    {0x7F,0x10,0x28,0x44,0x00}, // 107 k
+    {0x00,0x41,0x7F,0x40,0x00}, // 108 l
+    {0x7C,0x04,0x18,0x04,0x78}, // 109 m
+    {0x7C,0x08,0x04,0x04,0x78}, // 110 n
+    {0x38,0x44,0x44,0x44,0x38}, // 111 o
+    {0x7C,0x14,0x14,0x14,0x08}, // 112 p
+    {0x08,0x14,0x14,0x18,0x7C}, // 113 q
+    {0x7C,0x08,0x04,0x04,0x08}, // 114 r
+    {0x48,0x54,0x54,0x54,0x20}, // 115 s
+    {0x04,0x3F,0x44,0x40,0x20}, // 116 t
+    {0x3C,0x40,0x40,0x20,0x7C}, // 117 u
+    {0x1C,0x20,0x40,0x20,0x1C}, // 118 v
+    {0x3C,0x40,0x30,0x40,0x3C}, // 119 w
+    {0x44,0x28,0x10,0x28,0x44}, // 120 x
+    {0x0C,0x50,0x50,0x50,0x3C}, // 121 y
+    {0x44,0x64,0x54,0x4C,0x44}, // 122 z
+    {0x00,0x08,0x36,0x41,0x00}, // 123 {
+    {0x00,0x00,0x7F,0x00,0x00}, // 124 |
+    {0x00,0x41,0x36,0x08,0x00}, // 125 }
+    {0x08,0x08,0x2A,0x1C,0x08}, // 126 ~
+};
+
+// Desenha um caractere como pixels 2×2
+static void drawChar(IDirect3DDevice9* dev, float x, float y, char c, DWORD col) {
+    if ((unsigned char)c < 32 || (unsigned char)c > 126) c = '?';
+    const uint8_t* g = FONT5x7[(uint8_t)c - 32];
+    for (int col_ = 0; col_ < 5; col_++) {
+        for (int row = 0; row < 7; row++) {
+            if (g[col_] & (1 << row))
+                fillRect(dev, x + col_*2.0f, y + row*2.0f, 2.0f, 2.0f, col);
+        }
+    }
 }
 
-static constexpr float OX          = 10.0f;
-static constexpr float OY_BASE     = 40.0f;  // 30px abaixo do antigo (era 10)
-static constexpr float ROW_H       = 20.0f;
-static constexpr float ROW_W       = 155.0f;
-static constexpr float TEXT_X_OFF  = 20.0f;  // offset x do texto em relação a OX
-static constexpr DWORD TALK_MS     = 600;     // ms para considerar "falando"
+// Desenha texto. Cada char ocupa 12px (5×2 + 1 espaço × 2)
+static void drawText(IDirect3DDevice9* dev, float x, float y, const char* text, DWORD col) {
+    // Sombra preta (offset 1px) para legibilidade em qualquer fundo
+    for (const char* p = text; *p; ++p, x += 12.0f) {
+        drawChar(dev, x + 1.0f, y + 1.0f, *p, D3DCOLOR_ARGB(180, 0, 0, 0));
+        drawChar(dev, x, y, *p, col);
+    }
+}
 
-// Fase 1: retângulos D3D9 (dentro de BeginScene)
-static void drawVoiceRects(IDirect3DDevice9* dev) {
+// Ícone de microfone (14×16 px)
+static void drawMic(IDirect3DDevice9* dev, float x, float y, DWORD col) {
+    fillRect(dev, x+3, y+0,  8.0f, 9.0f,  col); // corpo
+    fillRect(dev, x+6, y+9,  2.0f, 4.0f,  col); // haste
+    fillRect(dev, x+3, y+13, 8.0f, 2.0f,  col); // base
+}
+
+static constexpr float OX       = 10.0f;
+static constexpr float OY_SELF  = 40.0f;  // ícone próprio
+static constexpr float OY_LIST  = 62.0f;  // lista de jogadores
+static constexpr float ROW_H    = 22.0f;
+static constexpr float ROW_W    = 200.0f;
+static constexpr DWORD TALK_MS  = 600;
+
+static void drawVoiceOverlay(IDirect3DDevice9* dev) {
+    if (FAILED(dev->TestCooperativeLevel())) return;
     DWORD now = GetTickCount();
 
-    // ── Salva estados ────────────────────────────────────────────────────────
-    DWORD sFVF, sZ, sAlpha, sSrc, sDst, sLight, sCull;
-    DWORD sCop, sCarg, sAop, sAarg;
+    // ── Obtém HWND para click detection ──────────────────────────────────────
+    D3DDEVICE_CREATION_PARAMETERS cp{};
+    HWND hwnd = SUCCEEDED(dev->GetCreationParameters(&cp)) ? cp.hFocusWindow : nullptr;
+
+    // Click detection (dispara apenas na borda de descida)
+    static bool s_lastBtn = false;
+    bool lBtn    = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    bool clicked = lBtn && !s_lastBtn;
+    s_lastBtn    = lBtn;
+    POINT pt{-1, -1};
+    if (clicked) { GetCursorPos(&pt); if (hwnd) ScreenToClient(hwnd, &pt); }
+
+    // ── Salva estados D3D ─────────────────────────────────────────────────────
+    DWORD sFVF, sZ, sAlpha, sSrc, sDst, sLight, sCull, sCop, sCarg, sAop, sAarg;
     IDirect3DBaseTexture9*  sTex = nullptr;
     IDirect3DVertexShader9* sVS  = nullptr;
     IDirect3DPixelShader9*  sPS  = nullptr;
-
     dev->GetFVF(&sFVF);
     dev->GetRenderState(D3DRS_ZENABLE,          &sZ);
     dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &sAlpha);
@@ -416,7 +525,7 @@ static void drawVoiceRects(IDirect3DDevice9* dev) {
     dev->GetVertexShader(&sVS);
     dev->GetPixelShader(&sPS);
 
-    // ── Pipeline 2D ──────────────────────────────────────────────────────────
+    // ── Pipeline 2D ───────────────────────────────────────────────────────────
     dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
     dev->SetRenderState(D3DRS_ZENABLE,          FALSE);
     dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
@@ -432,39 +541,73 @@ static void drawVoiceRects(IDirect3DDevice9* dev) {
     dev->SetVertexShader(nullptr);
     dev->SetPixelShader(nullptr);
 
-    float oy = OY_BASE;
+    // ── Indicador próprio (só ícone, sem linha) ────────────────────────────────
+    bool selfTalking = (now - g_txTick.load()) < 500;
+    bool selfMuted   = g_muted.load();
+    DWORD selfCol = selfMuted  ? D3DCOLOR_ARGB(220, 180, 40, 40)
+                  : selfTalking? D3DCOLOR_ARGB(220, 50, 200, 50)
+                  :              D3DCOLOR_ARGB(140, 110, 110, 110);
+    drawMic(dev, OX, OY_SELF, selfCol);
 
-    // Membros de party (sempre visíveis — cinza=idle, verde=falando)
+    // ── Lista de jogadores ────────────────────────────────────────────────────
+    float oy = OY_LIST;
+
+    auto drawRow = [&](float rowY, const char* name, bool talking, bool muted, bool& clickOut) {
+        DWORD micCol  = muted          ? D3DCOLOR_ARGB(220, 180, 40, 40)
+                      : talking        ? D3DCOLOR_ARGB(220, 50, 200, 50)
+                      :                  D3DCOLOR_ARGB(140, 110, 110, 110);
+        DWORD txtCol  = muted          ? D3DCOLOR_ARGB(255, 220, 60, 60)
+                      : talking        ? D3DCOLOR_ARGB(255, 60, 220, 60)
+                      :                  D3DCOLOR_ARGB(200, 160, 160, 160);
+
+        // Fundo semitransparente
+        fillRect(dev, OX, rowY, ROW_W, ROW_H - 2, D3DCOLOR_ARGB(130, 8, 8, 8));
+        // Microfone
+        drawMic(dev, OX + 2, rowY + 3, micCol);
+        // Nome (fonte pixel, sem GDI)
+        drawText(dev, OX + 20, rowY + 4, name, txtCol);
+
+        // Click em qualquer parte da linha → toggle mute
+        if (clicked &&
+            pt.x >= (int)OX && pt.x < (int)(OX + ROW_W) &&
+            pt.y >= (int)rowY && pt.y < (int)(rowY + ROW_H))
+            clickOut = true;
+    };
+
+    // Party (sempre visíveis)
     {
         std::lock_guard<std::mutex> lk(g_partyMtx);
         for (auto& pm : g_party) {
             bool talking = pm.lastTalkMs && (now - pm.lastTalkMs) < TALK_MS;
             pm.rowY = oy;
-
-            DWORD micCol;
-            if      (pm.muted)  micCol = D3DCOLOR_ARGB(230, 180, 40,  40);   // vermelho
-            else if (talking)   micCol = D3DCOLOR_ARGB(230, 50,  200, 50);   // verde
-            else                micCol = D3DCOLOR_ARGB(160, 120, 120, 120);  // cinza idle
-
-            fillRect(dev, OX, oy, ROW_W, ROW_H - 2, D3DCOLOR_ARGB(120, 8, 8, 8));
-            drawMic(dev, OX + 2, oy + 1, micCol);
+            bool click = false;
+            drawRow(oy, pm.name, talking, pm.muted, click);
+            if (click) pm.muted = !pm.muted;
             oy += ROW_H;
         }
     }
 
-    // Jogadores próximos (apenas quando estão falando)
+    // Próximos (cinza = no range mas calado, verde = falando)
     {
         std::lock_guard<std::mutex> lk(g_nearbyMtx);
-        for (auto& [id, ne] : g_nearby) {
-            if (!ne.lastTalkMs || (now - ne.lastTalkMs) >= TALK_MS) continue;
+        // Limpa entradas sem sinal recente de TCP nem UDP
+        static DWORD s_clean = 0;
+        if (now - s_clean > 5000) {
+            s_clean = now;
+            for (auto it = g_nearby.begin(); it != g_nearby.end();) {
+                bool tcpFresh  = it->second.lastSeenTcpMs && (now - it->second.lastSeenTcpMs < 3000);
+                bool talkFresh = it->second.lastTalkMs    && (now - it->second.lastTalkMs    < 8000);
+                it = (!tcpFresh && !talkFresh) ? g_nearby.erase(it) : ++it;
+            }
+        }
+        for (auto& [name, ne] : g_nearby) {
+            bool present = ne.lastSeenTcpMs && (now - ne.lastSeenTcpMs < 2000);
+            bool talking = ne.lastTalkMs    && (now - ne.lastTalkMs    < TALK_MS);
+            if (!present && !talking) continue;
             ne.rowY = oy;
-
-            DWORD micCol = ne.muted
-                ? D3DCOLOR_ARGB(230, 180, 40,  40)
-                : D3DCOLOR_ARGB(230, 50,  200, 50);
-
-            fillRect(dev, OX, oy, ROW_W, ROW_H - 2, D3DCOLOR_ARGB(120, 8, 8, 8));
-            drawMic(dev, OX + 2, oy + 1, micCol);
+            bool click = false;
+            drawRow(oy, name.c_str(), talking, ne.muted, click);
+            if (click) ne.muted = !ne.muted;
             oy += ROW_H;
         }
     }
@@ -483,138 +626,30 @@ static void drawVoiceRects(IDirect3DDevice9* dev) {
     dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, sAarg);
     dev->SetTexture(0, sTex);
     if (sTex) sTex->Release();
-    dev->SetVertexShader(sVS);
-    if (sVS) sVS->Release();
-    dev->SetPixelShader(sPS);
-    if (sPS) sPS->Release();
+    dev->SetVertexShader(sVS); if (sVS) sVS->Release();
+    dev->SetPixelShader(sPS);  if (sPS) sPS->Release();
 }
 
-// Fase 2: texto GDI no backbuffer (fora de BeginScene) + detecção de clique
-static void drawVoiceText(IDirect3DDevice9* dev, HWND hwnd) {
-    IDirect3DSurface9* bb = nullptr;
-    if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
-
-    HDC hdc = nullptr;
-    if (FAILED(bb->GetDC(&hdc))) { bb->Release(); return; }
-
-    // Cache da fonte
-    static HFONT s_font = nullptr;
-    if (!s_font)
-        s_font = CreateFontA(13, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, "Arial");
-    HFONT oldFont = s_font ? (HFONT)SelectObject(hdc, s_font) : nullptr;
-    SetBkMode(hdc, TRANSPARENT);
-
-    // Detecção de clique (uma vez por pressão, não por frame)
-    static bool s_lastBtn = false;
-    bool lBtn    = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-    bool clicked = lBtn && !s_lastBtn;
-    s_lastBtn    = lBtn;
-
-    POINT pt{-1, -1};
-    if (clicked) {
-        GetCursorPos(&pt);
-        if (hwnd) ScreenToClient(hwnd, &pt);
-    }
-
-    DWORD now = GetTickCount();
-    float oy   = OY_BASE;
-    float tx   = OX + TEXT_X_OFF;
-
-    // Membros de party
-    {
-        std::lock_guard<std::mutex> lk(g_partyMtx);
-        for (auto& pm : g_party) {
-            bool talking = pm.lastTalkMs && (now - pm.lastTalkMs) < TALK_MS;
-
-            COLORREF col;
-            if      (pm.muted) col = RGB(220, 60,  60);
-            else if (talking)  col = RGB(60,  220, 60);
-            else               col = RGB(160, 160, 160);
-
-            SetTextColor(hdc, col);
-            TextOutA(hdc, (int)tx, (int)oy + 2, pm.name, (int)strlen(pm.name));
-
-            // Clique no nome → toggle mute
-            if (clicked &&
-                pt.x >= (int)tx && pt.x < (int)(tx + 130) &&
-                pt.y >= (int)oy  && pt.y < (int)(oy + ROW_H))
-                pm.muted = !pm.muted;
-
-            oy += ROW_H;
-        }
-    }
-
-    // Jogadores próximos
-    {
-        std::lock_guard<std::mutex> lk(g_nearbyMtx);
-        for (auto& [id, ne] : g_nearby) {
-            if (!ne.lastTalkMs || (now - ne.lastTalkMs) >= TALK_MS) continue;
-
-            COLORREF col = ne.muted ? RGB(220, 60, 60) : RGB(60, 220, 60);
-
-            SetTextColor(hdc, col);
-            TextOutA(hdc, (int)tx, (int)oy + 2, ne.name, (int)strlen(ne.name));
-
-            if (clicked &&
-                pt.x >= (int)tx && pt.x < (int)(tx + 130) &&
-                pt.y >= (int)oy  && pt.y < (int)(oy + ROW_H))
-                ne.muted = !ne.muted;
-
-            oy += ROW_H;
-        }
-    }
-
-    if (oldFont) SelectObject(hdc, oldFont);
-    bb->ReleaseDC(hdc);
-    bb->Release();
-
-    // Limpa entradas stale do mapa de próximos a cada ~5s
-    static DWORD s_cleanupTick = 0;
-    if (now - s_cleanupTick > 5000) {
-        s_cleanupTick = now;
-        std::lock_guard<std::mutex> lk(g_nearbyMtx);
-        for (auto it = g_nearby.begin(); it != g_nearby.end();) {
-            if (now - it->second.lastTalkMs > 8000) it = g_nearby.erase(it);
-            else ++it;
-        }
-    }
-}
-
-// ── Detour inline (restore-call-repatch) ─────────────────────────────────────
+// ── Detour inline ─────────────────────────────────────────────────────────────
 struct Detour { BYTE* fnAddr; BYTE saved[5]; };
 static Detour g_detourPresent{};
 
 static inline void unpatch(Detour& d) {
-    DWORD old;
-    VirtualProtect(d.fnAddr, 5, PAGE_EXECUTE_READWRITE, &old);
-    memcpy(d.fnAddr, d.saved, 5);
-    FlushInstructionCache(GetCurrentProcess(), d.fnAddr, 5);
+    DWORD old; VirtualProtect(d.fnAddr, 5, PAGE_EXECUTE_READWRITE, &old);
+    memcpy(d.fnAddr, d.saved, 5); FlushInstructionCache(GetCurrentProcess(), d.fnAddr, 5);
     VirtualProtect(d.fnAddr, 5, old, &old);
 }
 static inline void repatch(Detour& d, void* hook) {
-    DWORD old;
-    VirtualProtect(d.fnAddr, 5, PAGE_EXECUTE_READWRITE, &old);
-    d.fnAddr[0] = 0xE9;
-    *(DWORD*)(d.fnAddr + 1) = (DWORD)hook - (DWORD)d.fnAddr - 5;
-    FlushInstructionCache(GetCurrentProcess(), d.fnAddr, 5);
-    VirtualProtect(d.fnAddr, 5, old, &old);
+    DWORD old; VirtualProtect(d.fnAddr, 5, PAGE_EXECUTE_READWRITE, &old);
+    d.fnAddr[0] = 0xE9; *(DWORD*)(d.fnAddr + 1) = (DWORD)hook - (DWORD)d.fnAddr - 5;
+    FlushInstructionCache(GetCurrentProcess(), d.fnAddr, 5); VirtualProtect(d.fnAddr, 5, old, &old);
 }
 
 static HRESULT WINAPI hookedPresent(IDirect3DDevice9* dev, const RECT* src, const RECT* dst, HWND wnd, const RGNDATA* rgn) {
-    if (g_run && SUCCEEDED(dev->TestCooperativeLevel())) {
-        // Fase 1: ícones de microfone via D3D9 (dentro de BeginScene)
-        if (SUCCEEDED(dev->BeginScene())) {
-            drawVoiceRects(dev);
-            dev->EndScene();
-        }
-        // Fase 2: nomes via GDI no backbuffer (fora de BeginScene)
-        D3DDEVICE_CREATION_PARAMETERS cp{};
-        HWND hwnd = SUCCEEDED(dev->GetCreationParameters(&cp)) ? cp.hFocusWindow : nullptr;
-        drawVoiceText(dev, hwnd);
+    if (g_run && SUCCEEDED(dev->BeginScene())) {
+        drawVoiceOverlay(dev);
+        dev->EndScene();
     }
-
     unpatch(g_detourPresent);
     HRESULT hr = ((Present_t)g_detourPresent.fnAddr)(dev, src, dst, wnd, rgn);
     repatch(g_detourPresent, (void*)hookedPresent);
@@ -622,93 +657,64 @@ static HRESULT WINAPI hookedPresent(IDirect3DDevice9* dev, const RECT* src, cons
 }
 
 static bool installDetour(Detour& d, void* fnAddr, void* hook) {
-    d.fnAddr = (BYTE*)fnAddr;
-    DWORD old;
+    d.fnAddr = (BYTE*)fnAddr; DWORD old;
     if (!VirtualProtect(d.fnAddr, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
     memcpy(d.saved, d.fnAddr, 5);
-    d.fnAddr[0] = 0xE9;
-    *(DWORD*)(d.fnAddr + 1) = (DWORD)hook - (DWORD)d.fnAddr - 5;
-    VirtualProtect(d.fnAddr, 5, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), d.fnAddr, 5);
-    dbgLog("installDetour: %p patched -> %p  saved=[%02X %02X %02X %02X %02X]",
+    d.fnAddr[0] = 0xE9; *(DWORD*)(d.fnAddr + 1) = (DWORD)hook - (DWORD)d.fnAddr - 5;
+    VirtualProtect(d.fnAddr, 5, old, &old); FlushInstructionCache(GetCurrentProcess(), d.fnAddr, 5);
+    dbgLog("installDetour: %p -> %p  saved=[%02X %02X %02X %02X %02X]",
            fnAddr, hook, d.saved[0], d.saved[1], d.saved[2], d.saved[3], d.saved[4]);
     return true;
 }
 
 static void setupD3DHook() {
-    Sleep(500);
-    dbgLog("setupD3DHook: iniciando");
-
+    Sleep(500); dbgLog("setupD3DHook: iniciando");
     HMODULE hD3D = GetModuleHandleA("d3d9.dll");
     if (!hD3D) hD3D = LoadLibraryA("d3d9.dll");
-    if (!hD3D) { dbgLog("setupD3DHook: d3d9.dll nao encontrado"); return; }
-
+    if (!hD3D) { dbgLog("d3d9.dll nao encontrado"); return; }
     typedef IDirect3D9*(WINAPI* Create9_t)(UINT);
-    auto fnCreate = (Create9_t)GetProcAddress(hD3D, "Direct3DCreate9");
-    if (!fnCreate) { dbgLog("setupD3DHook: Direct3DCreate9 nao encontrado"); return; }
-
-    IDirect3D9* d3d = fnCreate(D3D_SDK_VERSION);
-    if (!d3d) { dbgLog("setupD3DHook: Direct3DCreate9 null"); return; }
-
-    HWND dummy = CreateWindowExA(0, "STATIC", "", WS_POPUP, 0, 0, 1, 1,
-                                 nullptr, nullptr, g_dllModule, nullptr);
-    D3DPRESENT_PARAMETERS pp{};
-    pp.SwapEffect = D3DSWAPEFFECT_DISCARD; pp.hDeviceWindow = dummy;
-    pp.Windowed = TRUE; pp.BackBufferFormat = D3DFMT_UNKNOWN;
-
+    auto fn = (Create9_t)GetProcAddress(hD3D, "Direct3DCreate9");
+    if (!fn) { dbgLog("Direct3DCreate9 nao encontrado"); return; }
+    IDirect3D9* d3d = fn(D3D_SDK_VERSION);
+    if (!d3d) { dbgLog("Direct3DCreate9 null"); return; }
+    HWND dummy = CreateWindowExA(0, "STATIC", "", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, g_dllModule, nullptr);
+    D3DPRESENT_PARAMETERS pp{}; pp.SwapEffect = D3DSWAPEFFECT_DISCARD; pp.hDeviceWindow = dummy; pp.Windowed = TRUE; pp.BackBufferFormat = D3DFMT_UNKNOWN;
     IDirect3DDevice9* dev = nullptr;
-    HRESULT hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dummy,
-                                   D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &dev);
-    if (FAILED(hr))
-        hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dummy,
-                               D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
-    if (FAILED(hr) || !dev) {
-        dbgLog("setupD3DHook: CreateDevice falhou hr=0x%08X", (unsigned)hr);
-        d3d->Release(); DestroyWindow(dummy); return;
-    }
-
+    HRESULT hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dummy, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &dev);
+    if (FAILED(hr)) hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dummy, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
+    if (FAILED(hr) || !dev) { dbgLog("CreateDevice falhou hr=0x%08X", (unsigned)hr); d3d->Release(); DestroyWindow(dummy); return; }
     void** vtbl = *reinterpret_cast<void***>(dev);
     void* addrPresent = vtbl[17];
     dbgLog("Present@%p", addrPresent);
-
     dev->Release(); d3d->Release(); DestroyWindow(dummy);
-
     bool ok = installDetour(g_detourPresent, addrPresent, (void*)hookedPresent);
-    dbgLog("setupD3DHook: detour Present=%s", ok ? "OK" : "FALHOU");
+    dbgLog("setupD3DHook: %s", ok ? "OK" : "FALHOU");
 }
 
 // ── voiceInit ─────────────────────────────────────────────────────────────────
 static void voiceInit() {
     {
-        char path[MAX_PATH];
-        GetModuleFileNameA(nullptr, path, MAX_PATH);
+        char path[MAX_PATH]; GetModuleFileNameA(nullptr, path, MAX_PATH);
         std::string dir = std::string(path).substr(0, std::string(path).rfind('\\'));
         g_logPath = dir + "\\voice_debug.log";
         FILE* f = nullptr; fopen_s(&f, g_logPath.c_str(), "w");
         if (f) { fprintf(f, "=== L2 Voice Debug ===\n"); fclose(f); }
     }
     dbgLog("voiceInit: inicio");
-
     g_vadThreshold = (float)atof(cfgGet("VadThreshold", "400").c_str());
-    dbgLog("VAD=%.0f", g_vadThreshold);
-
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
     std::string ip = cfgGet("ServerIP", "127.0.0.1");
-    dbgLog("ServerIP=%s", ip.c_str());
-
+    dbgLog("ServerIP=%s  VAD=%.0f  48kHz", ip.c_str(), g_vadThreshold);
     ZeroMemory(&g_serverAddr, sizeof(g_serverAddr));
-    g_serverAddr.sin_family = AF_INET;
-    g_serverAddr.sin_port   = htons(VOICE_PORT_UDP);
+    g_serverAddr.sin_family = AF_INET; g_serverAddr.sin_port = htons(VOICE_PORT_UDP);
     inet_pton(AF_INET, ip.c_str(), &g_serverAddr.sin_addr);
-
     g_udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_udp != INVALID_SOCKET) {
         sockaddr_in local{}; local.sin_family = AF_INET; local.sin_addr.s_addr = INADDR_ANY;
         bind(g_udp, (sockaddr*)&local, sizeof(local));
         DWORD to = 500; setsockopt(g_udp, SOL_SOCKET, SO_RCVTIMEO, (char*)&to, sizeof(to));
-        dbgLog("UDP OK -> %s:%d", ip.c_str(), VOICE_PORT_UDP);
+        dbgLog("UDP OK -> %s:7779", ip.c_str());
     }
-
     std::thread(posThread).detach();
     std::thread(recvThread).detach();
     std::thread(setupD3DHook).detach();
@@ -720,26 +726,18 @@ static void voiceInit() {
 BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
-        DisableThreadLibraryCalls(hMod);
-        g_dllModule = hMod;
-        {
-            char sys[MAX_PATH]; GetSystemDirectoryA(sys, MAX_PATH);
-            g_realDll = LoadLibraryA((std::string(sys) + "\\dinput8.dll").c_str());
-            if (g_realDll)
-                g_realFn = (DI8Create_fn)GetProcAddress(g_realDll, "DirectInput8Create");
-        }
-        g_run = true;
-        std::thread(voiceInit).detach();
-        break;
+        DisableThreadLibraryCalls(hMod); g_dllModule = hMod;
+        { char sys[MAX_PATH]; GetSystemDirectoryA(sys, MAX_PATH);
+          g_realDll = LoadLibraryA((std::string(sys) + "\\dinput8.dll").c_str());
+          if (g_realDll) g_realFn = (DI8Create_fn)GetProcAddress(g_realDll, "DirectInput8Create"); }
+        g_run = true; std::thread(voiceInit).detach(); break;
     case DLL_PROCESS_DETACH:
         g_run = false;
         if (g_waveIn) { waveInStop(g_waveIn); waveInReset(g_waveIn); waveInClose(g_waveIn); }
         if (g_udp != INVALID_SOCKET) closesocket(g_udp);
         if (g_tcp != INVALID_SOCKET) closesocket(g_tcp);
         { std::lock_guard<std::mutex> lk(g_spkMtx); for (auto& [id, s] : g_speakers) delete s; }
-        if (g_realDll) FreeLibrary(g_realDll);
-        WSACleanup();
-        break;
+        if (g_realDll) FreeLibrary(g_realDll); WSACleanup(); break;
     }
     return TRUE;
 }

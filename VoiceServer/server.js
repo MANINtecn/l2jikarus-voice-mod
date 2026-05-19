@@ -7,7 +7,7 @@ const VOICE_PORT  = 7779;
 const VOICE_RANGE = 200;    // unidades L2 (proximidade geral)
 const PKT_AUDIO   = 1;
 const STALE_MS    = 10000;
-const FRAME_BYTES = 640;    // 320 samples * 2 bytes (16kHz mono)
+const FRAME_BYTES = 1920;   // 960 samples * 2 bytes (48kHz mono, 20ms)
 const NAME_LEN    = 32;
 
 // InPacket (cliente → servidor): type(4)+x(4)+y(4)+z(4)+partyId(4)+name(32)+audio(640) = 692
